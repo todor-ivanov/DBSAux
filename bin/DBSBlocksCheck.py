@@ -34,7 +34,7 @@ if __name__ == '__main__':
     opts, args = opt.parse_known_args()
 
     # rcl = Client(account=msConfig['rucioAccount'])
-    rcl = Client(account='FIXME')
+    # rcl = Client(account='FIXME')
 
     con = cx_Oracle.connect(db_config.oraUser, db_config.oraPw, db_config.oraDsn)
     cursor = con.cursor()
@@ -43,7 +43,7 @@ if __name__ == '__main__':
     sqlStr = f"SELECT block_id, block_name FROM {owner}.blocks WHERE ROWNUM <= 5"
     pprint(cursor.execute(sqlStr).fetchall())
 
-    blocksFilePath = os.environ.get('WMA_ROOT_DIR', "/data/WMAgent.venv3") + '/debug/blocks/'
+    blocksFilePath = os.environ.get('WMA_ROOT_DIR', "/data/WMAgent.venv3") + '/srv/DBSAux/debug/blocks/'
     blocksFileName =  'dbsuploader_all_blocks.json'
     with open(blocksFilePath + '/../'  + blocksFileName, 'rb') as blocksFile:
         blocksList = json.load(blocksFile)
@@ -68,26 +68,41 @@ if __name__ == '__main__':
         print(f"BlockName:{blockName}:")
         print(f"BlockFileList: {pformat(fileList)}")
 
+    lfnAll = 0
+    for block in blockFilesLists:
+        lfnAll += len(blockFilesLists[block])
 
     # Checking for existing lfn records:
     blockDBSRecResults = {}
+    queryNum = 0
     for blockName, lfnList in blockFilesLists.items():
         if blockName not in blockDBSRecResults:
             blockDBSRecResults[blockName] = {}
         print(f"Block: {blockName}:")
         for lfn in lfnList:
-            sqlStr=f"SELECT block_name FROM {db_config.oraOwner}.blocks WHERE block_id = (SELECT block_id FROM cms_dbs3_k8s_global_owner.files WHERE logical_file_name = '{lfn}')"
+            blockDBSRecResults[blockName][lfn] = {}
+            queryNum += 1
+            sqlStr=f"SELECT block_name FROM {db_config.oraOwner}.blocks WHERE block_id = (SELECT block_id FROM {db_config.oraOwner}.files WHERE logical_file_name = '{lfn}')"
             res = cursor.execute(sqlStr).fetchall()
             if res:
                 if res[0][0] == blockName:
-                    blockDBSRecResults[blockName][lfn] = 'OK'
-                    print(f"\tLFN: {lfn}: OK")
+                    blockDBSRecResults[blockName][lfn]['status'] = 'OK'
+                    blockDBSRecResults[blockName][lfn]['blockName'] = res[0][0]
+                    print(f"\t{queryNum}: LFN: {lfn}: OK")
                 else:
-                    blockDBSRecResults[blockName][lfn] = f"Block MISMATCH: {res}"
-                    print(f"\tLFN: {lfn}: Block MISMATCH: {res}")
+                    blockDBSRecResults[blockName][lfn]['status'] = 'BLOCKMISMATCH'
+                    blockDBSRecResults[blockName][lfn]['blockName'] = res[0][0]
+                    print(f"\t{queryNum}: LFN: {lfn}: BLOCKMISMATCH: {res[0][0]}")
             else:
-                blockDBSRecResults[blockName][lfn] = 'MISSING'
-                print(f"LFN: {lfn}: MISSING")
+                blockDBSRecResults[blockName][lfn]['status'] = 'MISSING'
+                blockDBSRecResults[blockName][lfn]['blockName'] = ""
+                print(f"{queryNum}: LFN: {lfn}: MISSING")
+
+    # Save the results
+    with open(blocksFilePath + 'blockDBSRecords.pkl', 'wb') as blockDBSRecordsFile:
+        pickle.dump(blockDBSRecResults, blockDBSRecordsFile)
+    with open(blocksFilePath + 'blockDBSRecords.json', 'w') as blockDBSRecordsFile:
+         json.dump(blockDBSRecResults, blockDBSRecordsFile, indent=4)
 
     # -------------------------------------------------------------------------------
     # NOTE: The initial blocks list json was containing 3 records per block
