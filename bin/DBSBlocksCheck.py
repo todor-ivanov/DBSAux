@@ -6,6 +6,8 @@ import time
 import logging
 import json
 import re
+import pickle
+import datetime
 
 import db_config
 import cx_Oracle
@@ -33,8 +35,7 @@ if __name__ == '__main__':
                      help="Service configuration file.")
     opts, args = opt.parse_known_args()
 
-    # rcl = Client(account=msConfig['rucioAccount'])
-    # rcl = Client(account='FIXME')
+    rcl = Client(account='FIXME')
 
     con = cx_Oracle.connect(db_config.oraUser, db_config.oraPw, db_config.oraDsn)
     cursor = con.cursor()
@@ -57,7 +58,7 @@ if __name__ == '__main__':
         print(f"BlockHash: {blockHash}")
         blockRecords[blockName] = blockRec
         # with open(blocksFilePath + blockHash + '.json', 'w') as blockRecFile:
-        #     json.dump(blockRec, blockRecFile)
+        #     json.dump(blockRec, blockRecFile, indent=4)
 
     # Extract only the filenames per block:
     blockFilesLists = {}
@@ -76,26 +77,47 @@ if __name__ == '__main__':
     blockDBSRecResults = {}
     queryNum = 0
     for blockName, lfnList in blockFilesLists.items():
+        print(f"Block: {blockName}:")
         if blockName not in blockDBSRecResults:
             blockDBSRecResults[blockName] = {}
-        print(f"Block: {blockName}:")
+
+        # Fetch DBS Status for the block:
+        sqlStr=f"SELECT block_name, open_for_writing, file_count FROM {db_config.oraOwner}.blocks WHERE block_name='{blockName}'"
+        res = cursor.execute(sqlStr).fetchall()
+        if res:
+            blockDBSRecResults[blockName]['dbsStatus'] = dict(zip(('blockName', 'isOpen', 'fileCount'), res[0]))
+        else:
+            blockDBSRecResults[blockName]['dbsStatus'] = 'MISSING'
+
+        # Fetch Rucio Status for the block:
+        res = []
+        # Convert all datetime strings returned from Rucio to strings digestible by json
+        for rucioRec in rcl.list_dataset_replicas('cms', blockName):
+            for recField in ['created_at','updated_at','accessed_at']:
+                if isinstance(rucioRec[recField], datetime.datetime):
+                    rucioRec[recField] = rucioRec[recField].strftime('%Y-%m-%dT%H:%M:%S.%f')
+            res.append(rucioRec)
+        blockDBSRecResults[blockName]['rucioStatus'] = res or 'MISSING'
+
+        # Fetch DBS status per lfn
+        blockDBSRecResults[blockName]['files'] = {}
         for lfn in lfnList:
-            blockDBSRecResults[blockName][lfn] = {}
+            blockDBSRecResults[blockName]['files'][lfn] = {}
             queryNum += 1
             sqlStr=f"SELECT block_name FROM {db_config.oraOwner}.blocks WHERE block_id = (SELECT block_id FROM {db_config.oraOwner}.files WHERE logical_file_name = '{lfn}')"
             res = cursor.execute(sqlStr).fetchall()
             if res:
                 if res[0][0] == blockName:
-                    blockDBSRecResults[blockName][lfn]['status'] = 'OK'
-                    blockDBSRecResults[blockName][lfn]['blockName'] = res[0][0]
+                    blockDBSRecResults[blockName]['files'][lfn]['dbsStatus'] = 'OK'
+                    blockDBSRecResults[blockName]['files'][lfn]['blockName'] = res[0][0]
                     print(f"\t{queryNum}: LFN: {lfn}: OK")
                 else:
-                    blockDBSRecResults[blockName][lfn]['status'] = 'BLOCKMISMATCH'
-                    blockDBSRecResults[blockName][lfn]['blockName'] = res[0][0]
+                    blockDBSRecResults[blockName]['files'][lfn]['dbsStatus'] = 'BLOCKMISMATCH'
+                    blockDBSRecResults[blockName]['files'][lfn]['blockName'] = res[0][0]
                     print(f"\t{queryNum}: LFN: {lfn}: BLOCKMISMATCH: {res[0][0]}")
             else:
-                blockDBSRecResults[blockName][lfn]['status'] = 'MISSING'
-                blockDBSRecResults[blockName][lfn]['blockName'] = ""
+                blockDBSRecResults[blockName]['files'][lfn]['dbsStatus'] = 'MISSING'
+                blockDBSRecResults[blockName]['files'][lfn]['blockName'] = ""
                 print(f"{queryNum}: LFN: {lfn}: MISSING")
 
     # Save the results
@@ -103,6 +125,30 @@ if __name__ == '__main__':
         pickle.dump(blockDBSRecResults, blockDBSRecordsFile)
     with open(blocksFilePath + 'blockDBSRecords.json', 'w') as blockDBSRecordsFile:
          json.dump(blockDBSRecResults, blockDBSRecordsFile, indent=4)
+
+    # continue to aggregate the dbsStatus results:
+    blockDBSRecResultsReduced={}
+    for blockName,block in blockDBSRecResults.items():
+        blockDBSRecResultsReduced[blockName]={}
+        blockDBSRecResultsReduced[blockName]['blockDBSStatus'] = ['OK'] if isinstance(block['dbsStatus'], dict) else  [block['dbsStatus']]
+        blockDBSRecResultsReduced[blockName]['filesDBSStatus'] = list(set([file['dbsStatus'] for file in block['files'].values()]))
+
+
+    # Final reduce of all blocks info at DBS and result:
+    blockDBSRecResultsReducedFinal = {}
+    for blockName, block in blockDBSRecResultsReduced.items():
+        if block['blockDBSStatus'] == block['filesDBSStatus'] == ['OK']:
+            blockDBSRecResultsReducedFinal[blockName] = 'OK'
+            print(f"\tblockName: {blockName}: OK")
+        elif block['blockDBSStatus'] == block['filesDBSStatus'] == ['MISSING']:
+            blockDBSRecResultsReducedFinal[blockName] = 'MISSING'
+            print(f"\tblockName: {blockName}: MISSING")
+        else:
+            blockDBSRecResultsReducedFinal[blockName] = {}
+            blockDBSRecResultsReducedFinal[blockName]['blockDBSStatus'] = block['blockDBSStatus']
+            blockDBSRecResultsReducedFinal[blockName]['filesDBSStatus'] = block['filesDBSStatus']
+            print(f"\tblockName: {blockName}: \n\t\tblockDBSStatus: {block['blockDBSStatus']}\n\t\tfilesDBSStatus: {block['filesDBSStatus']}")
+
 
     # -------------------------------------------------------------------------------
     # NOTE: The initial blocks list json was containing 3 records per block
